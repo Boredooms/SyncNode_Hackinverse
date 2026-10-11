@@ -357,11 +357,15 @@ async def tool_system_shell(
     timeout_seconds: int = 30,
     working_dir: Optional[str] = None,
     confirm: bool = True,   # default True — shell is always "confirmed" by the model calling it
+    on_output: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Run any PowerShell or CMD command on the local PC.
 
     Blocked patterns: format, mass-delete, bootloader, shutdown, registry writes.
     Returns stdout, stderr, exit_code, success.
+
+    If on_output(stream, chunk) is provided, output is streamed line-by-line as
+    it is produced (used by the chat terminal for live rendering).
     """
     blocked_reason = _shell_is_blocked(command)
     if blocked_reason:
@@ -382,8 +386,21 @@ async def tool_system_shell(
 
     logger.info("[SYSTEM] shell: %s", command[:120])
     try:
+        if on_output is not None:
+            rc, out_s, err_s = await _stream_proc(
+                cmd, str(cwd) if cwd else None, timeout_seconds, on_output
+            )
+            return {
+                "exit_code": rc,
+                "stdout": out_s[:20_000],
+                "stderr": err_s[:4_000],
+                "command": command,
+                "success": rc == 0,
+            }
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,  # closed stdin → interactive commands fail fast
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd) if cwd else None,
@@ -453,11 +470,68 @@ _CODE_BLOCKED_PATTERNS = [
     "ctypes", "winreg.SetValue", "format(", "deltree",
 ]
 
+async def _stream_proc(
+    cmd: list[str],
+    cwd: Optional[str],
+    timeout_seconds: int,
+    on_output: Optional[Any],
+) -> tuple[int, str, str]:
+    """Run a subprocess, streaming stdout/stderr lines to on_output(stream, chunk)
+    as they arrive. Returns (exit_code, full_stdout, full_stderr).
+
+    on_output may be an async callable (awaited) or a sync callable.
+    """
+    import asyncio
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,  # closed stdin → input() gets EOFError fast, never hangs
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+
+    async def _emit(stream_name: str, text: str) -> None:
+        if on_output is None or not text:
+            return
+        res = on_output(stream_name, text)
+        if asyncio.iscoroutine(res):
+            await res
+
+    async def _pump(reader, stream_name: str, buf: list[str]) -> None:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace")
+            buf.append(decoded)
+            await _emit(stream_name, decoded)
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                _pump(proc.stdout, "stdout", out_buf),
+                _pump(proc.stderr, "stderr", err_buf),
+            ),
+            timeout=timeout_seconds,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
+    return proc.returncode or 0, "".join(out_buf), "".join(err_buf)
+
+
 async def tool_system_run_code(
     code: str,
     language: str = "python",
     timeout_seconds: int = 30,
     working_dir: Optional[str] = None,
+    on_output: Optional[Any] = None,
 ) -> dict[str, Any]:
     """
     Execute code in a sandboxed subprocess and return stdout/stderr/exit_code.
@@ -466,7 +540,16 @@ async def tool_system_run_code(
       python     — runs with the current Python interpreter
       powershell — runs via PowerShell -Command
       javascript — runs via Node.js (if installed)
+      typescript — runs via ts-node / npx ts-node (if installed)
       bash       — runs via bash (if available)
+      ruby       — runs via ruby (if installed)
+      rust       — compiled with rustc then executed (if installed)
+      go         — runs via `go run` (if installed)
+      c / cpp    — compiled with gcc/clang (g++/clang++) then executed
+
+    Compiled languages (rust, go, c, cpp) are compiled first; compiler errors are
+    returned with success=false and the compiler stderr. If a required runtime or
+    compiler is missing, an explicit error names what to install.
 
     Safety:
       - Timeout enforced (default 30s)
@@ -489,7 +572,52 @@ async def tool_system_run_code(
             "reason": f"Code contains blocked pattern(s): {blocked}",
         }
 
-    import asyncio, tempfile, os
+    # Interactive-input guard. The sandbox has no stdin (DEVNULL), so code that
+    # waits for keyboard input (input(), sys.stdin.read(), Read-Host, prompt(),
+    # scanf, etc.) can never receive it. Rather than let it fail obscurely, we
+    # reject it up front with an explicit, actionable message so the model
+    # rewrites the program with fixed values instead of looping on timeouts.
+    _interactive_patterns = {
+        "python": ["input(", "sys.stdin.read", "sys.stdin.readline", "raw_input("],
+        "javascript": ["prompt(", "readline", "process.stdin"],
+        "typescript": ["prompt(", "readline", "process.stdin"],
+        "powershell": ["read-host"],
+        "ruby": ["gets", "stdin.read"],
+        "c": ["scanf(", "getchar(", "fgets(", "gets("],
+        "cpp": ["cin >>", "std::cin", "scanf(", "getline("],
+        "go": ["fmt.scan", "bufio.newreader(os.stdin"],
+        "rust": ["read_line(", "io::stdin("],
+    }
+    _lang_key = {"js": "javascript", "node": "javascript", "ts": "typescript",
+                 "pwsh": "powershell", "ps": "powershell", "rb": "ruby",
+                 "c++": "cpp", "cxx": "cpp", "golang": "go", "rs": "rust"}.get(lang, lang)
+    for pat in _interactive_patterns.get(_lang_key, []):
+        if pat in code_lower:
+            return {
+                "exit_code": -1, "success": False, "stdout": "", "stderr": "",
+                "error": (
+                    f"Interactive input ({pat.rstrip('(')}) is not supported — this "
+                    "sandbox has no stdin, so the program would hang waiting for input. "
+                    "Rewrite the code to use FIXED values (hard-code the inputs or pass "
+                    "them as variables at the top) instead of reading from the user. "
+                    "For example, replace input() with a literal value."
+                ),
+                "interactive_blocked": True,
+            }
+
+    import asyncio, tempfile, os, shutil
+
+    # Supported languages (for explicit, helpful error messages).
+    _SUPPORTED = "python, powershell, javascript, bash, rust, go, c, cpp, typescript, ruby"
+
+    # cleanup can be a single path or a list of paths/dirs to remove afterwards.
+    cleanup: Any = None
+    # compile_cmd runs before cmd (for compiled languages); None for interpreted.
+    compile_cmd: Optional[list[str]] = None
+    cmd: Optional[list[str]] = None
+
+    def _runtime_available(exe: str) -> bool:
+        return shutil.which(exe) is not None
 
     # Build the command
     if lang == "python":
@@ -510,6 +638,16 @@ async def tool_system_run_code(
             tmp = f.name
         cmd = ["node", tmp]
         cleanup = tmp
+    elif lang in ("typescript", "ts"):
+        if not _runtime_available("ts-node") and not _runtime_available("npx"):
+            return {"exit_code": -1, "success": False, "stdout": "", "stderr": "",
+                    "error": "TypeScript runtime not found. Install Node.js and ts-node (npm i -g ts-node)."}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ts",
+                                          delete=False, encoding="utf-8") as f:
+            f.write(code)
+            tmp = f.name
+        cmd = ["ts-node", tmp] if _runtime_available("ts-node") else ["npx", "ts-node", tmp]
+        cleanup = tmp
     elif lang in ("bash", "sh"):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".sh",
                                           delete=False, encoding="utf-8") as f:
@@ -517,15 +655,119 @@ async def tool_system_run_code(
             tmp = f.name
         cmd = ["bash", tmp]
         cleanup = tmp
+    elif lang in ("ruby", "rb"):
+        if not _runtime_available("ruby"):
+            return {"exit_code": -1, "success": False, "stdout": "", "stderr": "",
+                    "error": "Ruby runtime not found. Install Ruby to run ruby code."}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".rb",
+                                          delete=False, encoding="utf-8") as f:
+            f.write(code)
+            tmp = f.name
+        cmd = ["ruby", tmp]
+        cleanup = tmp
+    elif lang in ("rust", "rs"):
+        # Rust: compile with rustc, then run the produced binary.
+        if not _runtime_available("rustc"):
+            return {"exit_code": -1, "success": False, "stdout": "", "stderr": "",
+                    "error": "Rust compiler (rustc) not found. Install Rust from https://rustup.rs to run rust code."}
+        tmpdir = tempfile.mkdtemp(prefix="syncnode_rust_")
+        src = os.path.join(tmpdir, "main.rs")
+        binx = os.path.join(tmpdir, "main.exe" if os.name == "nt" else "main")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(code)
+        compile_cmd = ["rustc", src, "-o", binx, "--edition", "2021"]
+        cmd = [binx]
+        cleanup = tmpdir
+    elif lang in ("go", "golang"):
+        if not _runtime_available("go"):
+            return {"exit_code": -1, "success": False, "stdout": "", "stderr": "",
+                    "error": "Go toolchain (go) not found. Install Go to run go code."}
+        tmpdir = tempfile.mkdtemp(prefix="syncnode_go_")
+        src = os.path.join(tmpdir, "main.go")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(code)
+        cmd = ["go", "run", src]
+        cleanup = tmpdir
+    elif lang in ("c",):
+        if not _runtime_available("gcc") and not _runtime_available("clang"):
+            return {"exit_code": -1, "success": False, "stdout": "", "stderr": "",
+                    "error": "C compiler (gcc/clang) not found. Install one to run c code."}
+        compiler = "gcc" if _runtime_available("gcc") else "clang"
+        tmpdir = tempfile.mkdtemp(prefix="syncnode_c_")
+        src = os.path.join(tmpdir, "main.c")
+        binx = os.path.join(tmpdir, "main.exe" if os.name == "nt" else "main")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(code)
+        compile_cmd = [compiler, src, "-o", binx]
+        cmd = [binx]
+        cleanup = tmpdir
+    elif lang in ("cpp", "c++", "cxx"):
+        if not _runtime_available("g++") and not _runtime_available("clang++"):
+            return {"exit_code": -1, "success": False, "stdout": "", "stderr": "",
+                    "error": "C++ compiler (g++/clang++) not found. Install one to run cpp code."}
+        compiler = "g++" if _runtime_available("g++") else "clang++"
+        tmpdir = tempfile.mkdtemp(prefix="syncnode_cpp_")
+        src = os.path.join(tmpdir, "main.cpp")
+        binx = os.path.join(tmpdir, "main.exe" if os.name == "nt" else "main")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(code)
+        compile_cmd = [compiler, src, "-o", binx, "-std=c++17"]
+        cmd = [binx]
+        cleanup = tmpdir
     else:
         return {"exit_code": -1, "success": False, "stdout": "", "stderr": "",
-                "error": f"Unsupported language: {language}. Use: python, powershell, javascript, bash"}
+                "error": f"Unsupported language: {language}. Use: {_SUPPORTED}"}
 
     cwd = working_dir if working_dir and Path(working_dir).exists() else None
 
+    def _cleanup() -> None:
+        if not cleanup:
+            return
+        paths = cleanup if isinstance(cleanup, list) else [cleanup]
+        for p in paths:
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except Exception:
+                pass
+
     try:
+        # Compile step (compiled languages only).
+        if compile_cmd is not None:
+            cproc = await asyncio.create_subprocess_exec(
+                *compile_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+            )
+            cout, cerr = await asyncio.wait_for(
+                cproc.communicate(), timeout=timeout_seconds
+            )
+            if cproc.returncode != 0:
+                return {
+                    "exit_code": cproc.returncode, "success": False,
+                    "stdout": (cout or b"").decode("utf-8", errors="replace")[:4_000],
+                    "stderr": (cerr or b"").decode("utf-8", errors="replace")[:4_000],
+                    "language": lang,
+                    "error": f"Compilation failed ({lang}).",
+                }
+
+        if on_output is not None:
+            # Streaming path — emit output line-by-line as it arrives.
+            rc, out_s, err_s = await _stream_proc(cmd, cwd, timeout_seconds, on_output)
+            return {
+                "exit_code": rc,
+                "stdout": out_s[:10_000],
+                "stderr": err_s[:2_000],
+                "success": rc == 0,
+                "language": lang,
+            }
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,  # closed stdin → input() fails fast, never hangs
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
@@ -549,11 +791,7 @@ async def tool_system_run_code(
     except Exception as exc:
         return {"exit_code": -1, "success": False, "stdout": "", "stderr": str(exc)}
     finally:
-        if cleanup:
-            try:
-                os.unlink(cleanup)
-            except Exception:
-                pass
+        _cleanup()
 
 
 async def tool_system_terminal(
@@ -561,6 +799,7 @@ async def tool_system_terminal(
     shell: str = "powershell",
     timeout_seconds: int = 60,
     working_dir: Optional[str] = None,
+    on_output: Optional[Any] = None,
 ) -> dict[str, Any]:
     """
     Run a terminal command and return the full output.
@@ -586,6 +825,7 @@ async def tool_system_terminal(
         shell=shell,
         timeout_seconds=timeout_seconds,
         working_dir=working_dir,
+        on_output=on_output,
     )
 
 
@@ -767,7 +1007,8 @@ def register_system_tools(registry) -> None:
             version=1,
             description=(
                 "Execute code in a sandboxed subprocess and return stdout/stderr. "
-                "Supports: python, powershell, javascript (Node.js), bash. "
+                "Supports: python, powershell, javascript (Node.js), typescript, bash, "
+                "ruby, rust (rustc), go, c (gcc/clang), cpp (g++/clang++). "
                 "Use for: data analysis, file processing, calculations, "
                 "generating reports from data, testing algorithms, automation scripts. "
                 "Output capped at 10,000 chars. Timeout default 30s."

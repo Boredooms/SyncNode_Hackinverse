@@ -271,9 +271,24 @@ CODE EXECUTION:
   system.run_code(code="...", language="python")      — Python scripts, data analysis
   system.run_code(code="...", language="powershell")  — PowerShell scripts
   system.run_code(code="...", language="javascript")  — Node.js scripts
+  system.run_code(code="...", language="rust")        — Rust (compiled with rustc)
+  system.run_code(code="...", language="go"|"c"|"cpp"|"typescript"|"ruby")
   system.terminal(command="pip list")                 — direct terminal, any command
   system.terminal(command="python script.py")         — run scripts
   system.terminal(command="ipconfig /all")            — system info
+
+CRITICAL — CODE MUST BE NON-INTERACTIVE:
+  The sandbox has NO stdin. Code that waits for keyboard input will be REJECTED
+  (not run) with an "interactive input not supported" error. NEVER use:
+    input() / raw_input() / sys.stdin  (Python)
+    prompt() / readline / process.stdin (JS/TS)
+    Read-Host (PowerShell), gets (Ruby), scanf/cin/getchar (C/C++),
+    fmt.Scan (Go), io::stdin (Rust)
+  Instead, HARD-CODE the inputs as variables at the top of the program.
+  Example — DON'T: num = int(input("Enter number: "))
+            DO:    num = 1231   # fixed test value
+  If a tool call returns interactive_blocked=true, DO NOT retry the same code —
+  rewrite it with fixed values before running again.
 """
 
 
@@ -816,6 +831,16 @@ async def chat_stream(session_id: str, req: SendMessageRequest):
             tool_calls_made: list[dict] = []
             tool_results_list: list[dict] = []
             in_tokens = out_tokens = 0
+            # Loop-guard: remember (tool,args) signatures that already failed so
+            # we can stop the model re-running the exact same failing call (e.g.
+            # an interactive-input program that keeps timing out).
+            _failed_signatures: set[str] = set()
+            # Also track failure *reasons* per tool — the model often retries the
+            # same broken approach with cosmetically different code (new variable
+            # names), so exact-arg matching misses it. If a tool fails the same
+            # way (e.g. interactive_blocked, or timeout) twice, stop the loop.
+            _failed_reasons: dict[str, int] = {}
+            _loop_broken = False
 
             for _round in range(5):
                 req_obj = ModelRequest(
@@ -875,9 +900,94 @@ async def chat_stream(session_id: str, req: SendMessageRequest):
                     raw_args = fn.get("arguments", fn.get("args", {}))
                     targs = raw_args if isinstance(raw_args, dict) else {}
 
+                    # Loop-guard: if this exact (tool, args) already failed this
+                    # turn, don't re-run it — tell the model and stop the loop.
+                    import hashlib as _hashlib
+                    _sig = _hashlib.sha1(
+                        (tname + json.dumps(targs, sort_keys=True, ensure_ascii=False)).encode("utf-8")
+                    ).hexdigest()
+                    if _sig in _failed_signatures:
+                        msg = (
+                            f"Repeated identical call to {tname} that already failed — "
+                            "stopping to avoid a loop. Change the inputs before trying again."
+                        )
+                        model_messages.append(Message(role="tool", content=msg))
+                        if not full_response.strip():
+                            full_response += (
+                                "That approach failed and re-running the same code won't help. "
+                                "The code needs fixed (non-interactive) inputs. Tell me the values "
+                                "to use and I'll rewrite it."
+                            )
+                            yield _sse({"type": "delta", "content": full_response})
+                        _loop_broken = True
+                        break
+
                     yield _sse({"type": "tool_start", "tool": tname, "args": targs})
 
-                    result = await _execute_tool(tname, targs, run_id=run_id)
+                    # ── Live-streaming path for code/terminal tools ──────────
+                    # These stream stdout/stderr line-by-line so the chat
+                    # terminal shows output as it is produced, not just a final
+                    # blob. Other tools use the normal (awaited) path.
+                    _streaming_tools = {
+                        "system_run_code", "system.run_code",
+                        "system_terminal", "system.terminal",
+                        "system_shell", "system.shell",
+                    }
+                    if tname in _streaming_tools:
+                        import asyncio as _aio
+                        from syncnode_backend.system.tools import (
+                            tool_system_run_code as _trc,
+                            tool_system_terminal as _tterm,
+                            tool_system_shell as _tshell,
+                        )
+                        _q: "_aio.Queue[Optional[dict]]" = _aio.Queue()
+                        _is_code = tname in ("system_run_code", "system.run_code")
+                        _is_shell = tname in ("system_shell", "system.shell")
+                        _key = "system.run_code" if _is_code else (
+                            "system.shell" if _is_shell else "system.terminal")
+
+                        async def _on_output(stream_name: str, chunk: str) -> None:
+                            await _q.put({"stream": stream_name, "chunk": chunk})
+
+                        async def _run_streaming() -> dict:
+                            try:
+                                if _is_code:
+                                    r = await _trc(
+                                        code=str(targs.get("code", "")),
+                                        language=str(targs.get("language", "python")),
+                                        timeout_seconds=int(targs.get("timeout_seconds", 30) or 30),
+                                        working_dir=targs.get("working_dir"),
+                                        on_output=_on_output,
+                                    )
+                                else:
+                                    _fn = _tshell if _is_shell else _tterm
+                                    r = await _fn(
+                                        command=str(targs.get("command", "")),
+                                        shell=str(targs.get("shell", "powershell")),
+                                        timeout_seconds=int(targs.get("timeout_seconds", 60) or 60),
+                                        working_dir=targs.get("working_dir"),
+                                        on_output=_on_output,
+                                    )
+                                return {"success": r.get("success", False), "tool": _key, "result": r}
+                            except Exception as _exc:  # noqa: BLE001
+                                return {"success": False, "tool": _key, "error": str(_exc)}
+                            finally:
+                                await _q.put(None)  # sentinel
+
+                        _task = _aio.create_task(_run_streaming())
+                        while True:
+                            item = await _q.get()
+                            if item is None:
+                                break
+                            yield _sse({
+                                "type": "terminal_output",
+                                "tool": tname,
+                                "stream": item["stream"],
+                                "chunk": item["chunk"][:2000],
+                            })
+                        result = await _task
+                    else:
+                        result = await _execute_tool(tname, targs, run_id=run_id)
                     tool_calls_made.append({"tool": tname, "args": targs})
                     tool_results_list.append(result)
 
@@ -895,6 +1005,42 @@ async def chat_stream(session_id: str, req: SendMessageRequest):
                         role="tool",
                         content=f"Tool {tname} returned: {result_text[:800]}",
                     ))
+
+                    # Record failing signatures so an identical retry is caught.
+                    if not result.get("success"):
+                        _failed_signatures.add(_sig)
+                        # Classify the failure reason so cosmetically-different
+                        # retries of the same broken approach are also caught.
+                        inner = result.get("result", result)
+                        reason_key = None
+                        if isinstance(inner, dict):
+                            if inner.get("interactive_blocked"):
+                                reason_key = f"{tname}:interactive"
+                            elif inner.get("blocked"):
+                                reason_key = f"{tname}:blocked"
+                            elif "timed out" in str(inner.get("error", "")).lower():
+                                reason_key = f"{tname}:timeout"
+                        if reason_key:
+                            _failed_reasons[reason_key] = _failed_reasons.get(reason_key, 0) + 1
+                            if _failed_reasons[reason_key] >= 2:
+                                stop_note = (
+                                    f"{tname} has now failed the same way "
+                                    f"({reason_key.split(':')[1]}) twice. Stopping to avoid a loop. "
+                                    "Re-running similar code will not help — the inputs must change."
+                                )
+                                model_messages.append(Message(role="tool", content=stop_note))
+                                if not full_response.strip():
+                                    full_response += (
+                                        "I stopped because the same approach keeps failing the same "
+                                        "way. If this is an interactive program, tell me the exact "
+                                        "input values to hard-code and I'll rewrite it to run cleanly."
+                                    )
+                                    yield _sse({"type": "delta", "content": full_response})
+                                _loop_broken = True
+                                break
+
+                if _loop_broken:
+                    break
 
             # ── Persist assistant message ─────────────────────────────────────
             # If the model only called tools and emitted no text, generate a
