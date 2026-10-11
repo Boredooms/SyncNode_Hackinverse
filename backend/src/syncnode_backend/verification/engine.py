@@ -230,6 +230,15 @@ async def assert_command_succeeded(
         or tr.get("sent", False)
         or tr.get("written", False)
         or tr.get("set", False)
+        # Read/inspect tools (excel.inspect, excel.read_*, document.read_*)
+        # succeed by returning the resolved file's data. "exists: True" means
+        # the file was found and read — that is a successful command.
+        or tr.get("exists", False)
+        or ("values" in tr and tr.get("values") is not None)
+        or ("value" in tr and tr.get("value") is not None)
+        or ("sheets" in tr)
+        or ("content" in tr and bool(tr.get("content")))
+        or ("text" in tr and bool(tr.get("text")))
     )
     # If no tool result at all but assertion is requested, pass it through
     # (e.g. a purely observational step where the tool hasn't been called yet)

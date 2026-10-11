@@ -243,10 +243,14 @@ async def tool_excel_read_range(path: str, cell_range: str,
 
 
 async def tool_excel_inspect(path: str) -> dict[str, Any]:
-    """Inspect workbook structure: sheets, dimensions, non-empty cell count."""
+    """Inspect workbook structure: sheets, dimensions, non-empty cell count.
+
+    Accepts bare filename — resolves uploaded workbooks from workspace/uploads
+    (and the rest of the workspace), consistent with excel.read_cell/read_range.
+    """
     from openpyxl import load_workbook
 
-    p = _safe(path)
+    p = await _resolve_xlsx_path(path)
     if not p.exists():
         return {"exists": False, "path": str(p)}
     wb = load_workbook(str(p), data_only=True)
