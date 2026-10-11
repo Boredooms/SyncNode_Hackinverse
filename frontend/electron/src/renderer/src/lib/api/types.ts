@@ -311,6 +311,7 @@ export interface ChatSessionDetail extends ChatSession {
 export type ChatStreamEvent =
   | { type: 'delta';       content: string }
   | { type: 'tool_start';  tool: string; args: Record<string, unknown> }
+  | { type: 'terminal_output'; tool: string; stream: 'stdout' | 'stderr'; chunk: string }
   | { type: 'tool_result'; tool: string; success: boolean; result: string }
   | { type: 'summary';     text: string }
   | { type: 'status';      text: string }

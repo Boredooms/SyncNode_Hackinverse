@@ -4,7 +4,7 @@ import {
   Send, Plus, Trash2, MessageSquare, Wrench, Cpu,
   ChevronDown, Zap, Loader2, AlertCircle, BookOpen, X,
   Paperclip, FileText, FileSpreadsheet, Presentation, File,
-  CheckCircle2, Terminal, Code2, Check, Image, FileCode,
+  CheckCircle2, Terminal, Code2, Check, Image, FileCode, Copy,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import {
@@ -59,18 +59,36 @@ interface ToolExecution {
   result?: string
   success?: boolean
   done: boolean
+  liveOutput?: string   // streamed stdout/stderr accumulated live during execution
 }
 
 // Detect if a tool is code/terminal related
 function isCodeTool(tool: string) {
   return ['system_run_code', 'system_terminal', 'system_shell'].includes(tool)
 }
+
+// Pretty-print a tool result: if it is JSON, indent it; otherwise return as-is.
+// Keeps terminal/code output readable without mangling plain text.
+function formatToolResult(raw: string): string {
+  if (!raw) return raw
+  const trimmed = raw.trim()
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2)
+    } catch { /* not valid JSON — fall through */ }
+  }
+  return raw
+}
 function isDocTool(tool: string) {
   return tool.startsWith('document_read') || tool.startsWith('document_inspect')
 }
 
 function ToolCard({ exec }: { exec: ToolExecution }) {
+  // Auto-open while a code/terminal tool is actively streaming output.
+  const streamingLive = !exec.done && isCodeTool(exec.tool)
   const [open, setOpen] = useState(false)
+  const effectiveOpen = open || streamingLive || (!!exec.liveOutput && !exec.done)
   const color = exec.done
     ? exec.success ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-red-500/20 bg-red-500/5'
     : 'border-white/[0.07] bg-white/[0.02]'
@@ -97,15 +115,27 @@ function ToolCard({ exec }: { exec: ToolExecution }) {
           </span>
         )}
         {!exec.done && <Loader2 size={10} className="animate-spin text-white/35" />}
-        <ChevronDown size={10} className={cn('text-white/25 transition-transform', open && 'rotate-180')} />
+        <ChevronDown size={10} className={cn('text-white/25 transition-transform', effectiveOpen && 'rotate-180')} />
       </button>
-      {open && (
+      {effectiveOpen && (
         <div className="px-3 pb-3 space-y-2 border-t border-white/[0.05] pt-2">
           {Object.keys(exec.args).length > 0 && (
             <div>
               <p className="text-white/25 text-[9px] uppercase tracking-wider mb-1">args</p>
               <pre className="text-white/55 text-[10px] leading-snug whitespace-pre-wrap break-all bg-white/[0.02] rounded p-2">
                 {JSON.stringify(exec.args, null, 2).slice(0, 600)}
+              </pre>
+            </div>
+          )}
+          {exec.liveOutput && (
+            <div>
+              <p className="text-white/25 text-[9px] uppercase tracking-wider mb-1 flex items-center gap-1">
+                <Terminal size={9} className="text-yellow-400/50" /> terminal
+                {!exec.done && <span className="text-amber-400/70 normal-case tracking-normal">live</span>}
+              </p>
+              <pre className="text-[10px] leading-snug whitespace-pre-wrap break-all rounded p-2 bg-black/40 text-white/70 max-h-60 overflow-y-auto">
+                {exec.liveOutput.slice(-4000)}
+                {!exec.done && <span className="inline-block w-1.5 h-3 bg-emerald-400/70 animate-pulse align-middle ml-0.5" />}
               </pre>
             </div>
           )}
@@ -116,7 +146,7 @@ function ToolCard({ exec }: { exec: ToolExecution }) {
                 'text-[10px] leading-snug whitespace-pre-wrap break-all rounded p-2',
                 exec.success ? 'text-emerald-300/70 bg-emerald-500/5' : 'text-red-300/70 bg-red-500/5'
               )}>
-                {exec.result.slice(0, 800)}
+                {formatToolResult(exec.result).slice(0, 1200)}
               </pre>
             </div>
           )}
@@ -135,6 +165,29 @@ interface LocalMessage {
   streaming?: boolean
   error?: string
   usage?: { in: number; out: number }
+  files?: string[]   // absolute paths of files created/edited by this message's tools
+}
+
+// Extract a file path from a tool result string, if the tool touched a file.
+// Create/edit tools return {"path": "..."} (sometimes nested under "result").
+function extractFilePath(resultStr: string | undefined): string | null {
+  if (!resultStr) return null
+  try {
+    let obj: any = JSON.parse(resultStr)
+    if (obj && typeof obj === 'object' && obj.result && typeof obj.result === 'object') {
+      obj = obj.result
+    }
+    const p = obj?.path
+    if (typeof p === 'string' && /\.(docx?|xlsx?|pptx?|pdf|txt|md|csv|json|png)$/i.test(p)) {
+      return p
+    }
+  } catch { /* not JSON — ignore */ }
+  return null
+}
+
+function fileLeafName(path: string): string {
+  const parts = path.split(/[\\/]/)
+  return parts[parts.length - 1] || path
 }
 
 function renderContent(text: string) {
@@ -166,6 +219,90 @@ function renderContent(text: string) {
     parts.push(<span key={key++} className="whitespace-pre-wrap break-words">{text.slice(last)}</span>)
   }
   return parts
+}
+
+// Small copy-to-clipboard button for assistant answers.
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      /* clipboard unavailable — ignore */
+    }
+  }
+  return (
+    <button
+      onClick={onCopy}
+      title={copied ? 'Copied' : 'Copy answer'}
+      className="flex items-center gap-1 text-[10px] text-white/30 hover:text-white/70 transition-colors px-1 py-0.5 rounded"
+    >
+      {copied ? <Check size={11} className="text-emerald-400/80" /> : <Copy size={11} />}
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  )
+}
+
+// Files created/edited by this message — with an Open button + full path shown.
+function FilesStrip({ files }: { files: string[] }) {
+  const [opening, setOpening] = useState<string | null>(null)
+  const openFile = async (path: string) => {
+    setOpening(path)
+    try {
+      const result = await (window as any).api?.shell?.openPath(path)
+      if (result && result !== '') {
+        toast.error(`Could not open: ${result}`)
+      }
+    } catch (e: any) {
+      toast.error(`Open failed: ${e?.message ?? 'unknown error'}`)
+    } finally {
+      setOpening(null)
+    }
+  }
+  const revealFile = async (path: string) => {
+    // Open the containing folder (fallback to the file itself).
+    const dir = path.replace(/[\\/][^\\/]+$/, '')
+    try { await (window as any).api?.shell?.openPath(dir || path) } catch { /* ignore */ }
+  }
+  const fileIcon = (name: string) => attachFileIcon(name)
+  return (
+    <div className="w-full mt-1 rounded-xl border border-white/[0.07] bg-white/[0.02] overflow-hidden">
+      <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-white/[0.05]">
+        <FileText size={11} className="text-white/35" />
+        <span className="text-[10px] uppercase tracking-wider text-white/35">
+          Files ({files.length})
+        </span>
+      </div>
+      <div className="divide-y divide-white/[0.04]">
+        {files.map((path, i) => (
+          <div key={i} className="flex items-center gap-2 px-3 py-2">
+            {fileIcon(fileLeafName(path))}
+            <div className="flex-1 min-w-0">
+              <p className="text-[12px] text-white/80 truncate">{fileLeafName(path)}</p>
+              <p className="text-[9px] text-white/30 font-mono truncate" title={path}>{path}</p>
+            </div>
+            <button
+              onClick={() => revealFile(path)}
+              title="Show in folder"
+              className="text-[10px] text-white/35 hover:text-white/70 transition-colors px-1.5 py-1 rounded"
+            >
+              Folder
+            </button>
+            <button
+              onClick={() => openFile(path)}
+              title="Open file in its app"
+              className="flex items-center gap-1 text-[10px] text-white/55 hover:text-white/90 bg-white/[0.05] hover:bg-white/[0.1] transition-colors px-2 py-1 rounded"
+            >
+              {opening === path ? <Loader2 size={10} className="animate-spin" /> : <File size={10} />}
+              Open
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function MessageBubble({ msg }: { msg: LocalMessage }) {
@@ -210,10 +347,14 @@ function MessageBubble({ msg }: { msg: LocalMessage }) {
             {msg.toolExecutions.map((exec, i) => <ToolCard key={i} exec={exec} />)}
           </div>
         )}
+        {msg.files && msg.files.length > 0 && <FilesStrip files={msg.files} />}
         {msg.usage && (
           <p className="text-[10px] text-white/20 font-mono px-1">
             {msg.usage.in}↑ {msg.usage.out}↓ tokens
           </p>
+        )}
+        {!isUser && !msg.streaming && !msg.error && msg.content?.trim() && (
+          <CopyButton text={msg.content} />
         )}
       </div>
       {isUser && (
@@ -348,6 +489,12 @@ export function Chat() {
           success: (m.tool_results?.[i] as any)?.success ?? true,
           done: true,
         })),
+        // Rebuild the Files list for persisted assistant messages too.
+        files: (m.tool_results ?? []).reduce<string[]>((acc, tr: any) => {
+          const fp = extractFilePath(JSON.stringify(tr?.result ?? tr))
+          if (fp && !acc.includes(fp)) acc.push(fp)
+          return acc
+        }, []),
       })))
     } catch {}
   }
@@ -436,10 +583,21 @@ export function Chat() {
         } else if (event.type === 'tool_start') {
           toolMap.set(event.tool, { tool: event.tool, args: event.args, done: false })
           setMessages(prev => prev.map(m => m.id === aid ? { ...m, toolExecutions: [...toolMap.values()] } : m))
+        } else if (event.type === 'terminal_output') {
+          const exec = toolMap.get(event.tool)
+          if (exec) { exec.liveOutput = (exec.liveOutput ?? '') + event.chunk }
+          setMessages(prev => prev.map(m => m.id === aid ? { ...m, toolExecutions: [...toolMap.values()] } : m))
         } else if (event.type === 'tool_result') {
           const exec = toolMap.get(event.tool)
           if (exec) { exec.result = event.result; exec.success = event.success; exec.done = true }
-          setMessages(prev => prev.map(m => m.id === aid ? { ...m, toolExecutions: [...toolMap.values()] } : m))
+          // Collect any file this tool created/edited so we can offer "Open".
+          const fp = event.success ? extractFilePath(event.result) : null
+          setMessages(prev => prev.map(m => {
+            if (m.id !== aid) return m
+            const files = m.files ? [...m.files] : []
+            if (fp && !files.includes(fp)) files.push(fp)
+            return { ...m, toolExecutions: [...toolMap.values()], files }
+          }))
         } else if (event.type === 'summary') {
           setSummary(event.text)
         } else if (event.type === 'done') {
